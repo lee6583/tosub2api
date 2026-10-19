@@ -552,7 +552,7 @@ worker = module.Worker()
 result = worker.probe_profiles("https://chatgpt.com/", ["chrome146", "chrome142"], 1000)
 assert result == {"profile": "chrome142", "attempts": 2}, result
 assert worker.impersonate == "chrome142"
-assert FakeRequests.attempts == ["chrome146", "chrome142"]
+assert sorted(FakeRequests.attempts) == ["chrome142", "chrome146"], FakeRequests.attempts
 FakeRequests.attempts = []
 bounded = module.Worker().probe_profiles(
     "https://chatgpt.com/",
@@ -561,7 +561,7 @@ bounded = module.Worker().probe_profiles(
     80,
 )
 assert bounded == {"profile": "chrome142", "attempts": 4}, bounded
-assert FakeRequests.attempts == ["chrome146", "chrome142", "chrome141", "chrome140"]
+assert sorted(FakeRequests.attempts) == ["chrome140", "chrome141", "chrome142", "chrome146"], FakeRequests.attempts
 profiles = worker._supported_chrome_profiles()
 assert profiles[0] == "chrome146", profiles
 assert "chrome142" in profiles

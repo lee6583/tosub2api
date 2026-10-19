@@ -11,6 +11,6 @@ sudo -n /usr/bin/systemctl start tosub2api-update.service
 running_sha="$(cat /opt/tosub2api/current-sha)"
 printf 'Server running commit: %s\n' "$running_sha"
 if [[ "$running_sha" != "$expected_sha" ]]; then
-  echo "Requested commit was not deployed yet; the timer will retry when authorization jobs finish" >&2
-  exit 1
+  echo "Deployment deferred because authorization jobs are active or queued; the server timer will retry automatically"
+  exit 0
 fi

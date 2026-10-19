@@ -32,5 +32,14 @@ jobs:
           chmod 600 ~/.ssh/tosub2_deploy
           printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/tosub2_deploy \
-            tosub2deploy@173.249.209.85 deploy "$GITHUB_SHA"
+          set +e
+          output="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/tosub2_deploy \
+            tosub2deploy@173.249.209.85 deploy "$GITHUB_SHA" 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [[ $status -ne 0 && "$output" == *"Requested commit was not deployed yet; the timer will retry when authorization jobs finish"* ]]; then
+            echo 'Deployment request accepted; the server will update after active authorization jobs finish.'
+            exit 0
+          fi
+          exit "$status"
