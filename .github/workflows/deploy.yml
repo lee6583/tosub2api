@@ -1,0 +1,36 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request server update
+        env:
+          DEPLOY_KEY: ${{ secrets.TOSUB2_DEPLOY_KEY }}
+          SSH_HOST_KEY: ${{ secrets.TOSUB2_SSH_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DEPLOY_KEY" || -z "$SSH_HOST_KEY" ]]; then
+            echo 'Configure TOSUB2_DEPLOY_KEY and TOSUB2_SSH_HOST_KEY repository secrets' >&2
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tosub2_deploy
+          chmod 600 ~/.ssh/tosub2_deploy
+          printf '%s\n' "$SSH_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -i ~/.ssh/tosub2_deploy \
+            tosub2deploy@173.249.209.85 deploy "$GITHUB_SHA"

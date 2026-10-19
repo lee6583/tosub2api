@@ -124,9 +124,11 @@ scheduleSub2ApiMonitor();
 const vite = await createViteServer({
   root: WEB_ROOT,
   configFile: false,
+  cacheDir: "/tmp/tosub2-vite",
   appType: "spa",
   plugins: [react()],
   server: {
+    allowedHosts: ["tosub2.zrocode.org"],
     middlewareMode: true,
     hmr: { port: hmrPort, clientPort: hmrPort },
   },

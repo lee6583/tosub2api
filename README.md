@@ -64,6 +64,10 @@ http://127.0.0.1:4399
 
 本仓库的 `main` 分支推送到 `https://github.com/lee6583/tosub2api` 后，服务器上的 `tosub2api-update.timer` 每两分钟检查一次新提交。发现更新时，它用 `Dockerfile` 构建新镜像；只有当前没有运行或排队中的授权任务才会切换。任务输出和 Sub2API 配置保存在服务器 `/opt/tosub2api/data`，不会随容器更新删除。构建失败保留旧容器，新容器健康检查失败时尝试恢复旧镜像。查看部署日志：`journalctl -u tosub2api-update.service -n 100 --no-pager`。
 
+`Deploy` GitHub Actions 工作流也可在推送 `main` 后立即触发服务器更新。仓库的 Settings → Secrets and variables → Actions 中需配置 `TOSUB2_DEPLOY_KEY`（专用 SSH 私钥全文）和 `TOSUB2_SSH_HOST_KEY`（服务器 `173.249.209.85` 的已核验 `known_hosts` 公钥行）。服务器应为 `tosub2deploy` 安装对应公钥，SSH `authorized_keys` 使用 `command="/usr/local/sbin/tosub2api-action-trigger",restrict`，并仅通过 sudoers 允许该账号执行 `systemctl start tosub2api-update.service`；触发脚本为 `deploy/action-trigger.sh`。不要把 root 私钥放入 GitHub。若有授权任务正在执行，更新会推迟，Actions 本次运行报告失败，两分钟轮询会继续重试。推送前先提交本地修改：`git add . && git commit -m "Update toSub2" && git push origin main`。
+
+公网域名 `tosub2.zrocode.org` 使用 `deploy/tosub2.nginx.http.conf` 提供证书验证入口。DNS A 记录指向服务器后，以 `certbot certonly --webroot -w /var/www/acme -d tosub2.zrocode.org` 申请证书，再切换到 `deploy/tosub2.nginx.https.conf`。HTTPS 站点使用独立的 Nginx Basic Auth 密码，容器仍只监听本机；`certbot.timer` 负责自动续期。不要将密码或 `.htpasswd` 提交到仓库。
+
 首次安装需在已安装 Docker、Git、Python 3 的服务器上以 root 执行 `bash deploy/install-server.sh`。自动部署只监听服务器的 `127.0.0.1:4399`，不直接开放公网访问。可在本机建立 SSH 隧道：`ssh -i ~/.ssh/id_codex -L 4400:127.0.0.1:4399 root@<server-ip>`，再访问 `http://127.0.0.1:4400/`。Linux 当前不持久保存密码、2FA 密钥和账号代理，重启后依赖这些资料的自动重新登录功能不可用；需要持续使用这些功能时仍应使用本机 macOS 服务。
 
 本机改完代码后，先检查 `git status`，再执行 `git add <相关文件>`、`git commit -m "说明变更"` 和 `git push origin main`。GitHub 不会自动同步本机未提交的文件；不要把 `.env`、`tmp`、`.venv`、密钥或账号导出文件提交上去。本仓库是公开仓库。
