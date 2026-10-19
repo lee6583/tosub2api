@@ -35,6 +35,7 @@ import {
 import "./styles.css";
 
 const POLL_INTERVAL_MS = 900;
+const SUB2API_METRICS_POLL_INTERVAL_MS = 60_000;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
@@ -108,6 +109,7 @@ function App() {
     lastResult: null,
     intervalMinutes: 5,
   });
+  const [sub2apiAccountMetrics, setSub2apiAccountMetrics] = useState({});
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
@@ -194,6 +196,38 @@ function App() {
   }, [token, features.sub2apiMonitor]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
+  const metricEmailKey = useMemo(
+    () => [...new Set(jobs.map((job) => job.email.trim().toLowerCase()))].sort().join("\n"),
+    [jobs],
+  );
+
+  useEffect(() => {
+    if (!token || !features.sub2apiMetrics || !sub2apiMonitorStatus.configured || !metricEmailKey) {
+      setSub2apiAccountMetrics({});
+      return undefined;
+    }
+    let stopped = false;
+    let timer;
+    const load = async () => {
+      try {
+        const data = await apiFetch(token, "/api/sub2api/account-metrics", {
+          method: "POST",
+          body: JSON.stringify({ emails: metricEmailKey.split("\n") }),
+        });
+        if (!stopped) setSub2apiAccountMetrics(data.metrics || {});
+      } catch {
+        if (!stopped) setSub2apiAccountMetrics({});
+      } finally {
+        if (!stopped) timer = window.setTimeout(load, SUB2API_METRICS_POLL_INTERVAL_MS);
+      }
+    };
+    void load();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [token, features.sub2apiMetrics, sub2apiMonitorStatus.configured, sub2apiMonitorStatus.baseUrl, metricEmailKey]);
+
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
   const activeSmsProvider = useMemo(
     () => resolveSmsProvider(smsProviderDefinitions, smsSettings),
@@ -993,6 +1027,8 @@ function App() {
                 <th>账号</th>
                 <th>状态</th>
                 <th>当前操作</th>
+                <th>额度使用</th>
+                <th>累计用户消费</th>
                 <th>开始时间</th>
                 <th>最近操作时间</th>
                 <th className="actions-heading">操作</th>
@@ -1019,10 +1055,11 @@ function App() {
                     passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
+                    sub2apiMetric={sub2apiAccountMetrics[job.email.trim().toLowerCase()]}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="7"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="9"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -1559,7 +1596,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="7">
+      <td colSpan="9">
         <div className="empty-state">
           <div><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -1570,7 +1607,49 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function QuotaUsageCell({ metric }) {
+  const fiveHour = metric?.fiveHour;
+  if (!metric?.matched || !fiveHour) {
+    return (
+      <td className="quota-cell quota-cell-empty" title={metric?.error || (metric?.matched ? "Sub2API 暂无额度数据" : "Sub2API 中未找到该账号")}>
+        —
+      </td>
+    );
+  }
+  const utilization = Math.max(0, Number(fiveHour.utilization) || 0);
+  const displayPercent = utilization > 999 ? ">999%" : `${Math.round(utilization)}%`;
+  const level = utilization >= 100 ? "danger" : utilization >= 80 ? "warning" : "normal";
+  return (
+    <td className="quota-cell" title={`5 小时额度已使用 ${displayPercent}`}>
+      <div className="quota-line">
+        <span className="quota-label">5h</span>
+        <span className="quota-track" aria-hidden="true">
+          <span className={`quota-fill quota-${level}`} style={{ width: `${Math.min(utilization, 100)}%` }} />
+        </span>
+        <strong className={`quota-percent quota-${level}`}>{displayPercent}</strong>
+      </div>
+      <div className="quota-reset">{formatQuotaReset(fiveHour.resetsAt, fiveHour.remainingSeconds)}</div>
+    </td>
+  );
+}
+
+function UserConsumptionCell({ metric }) {
+  const totalUserCost = metric?.totalUserCost == null ? null : Number(metric.totalUserCost);
+  const available = metric?.matched && Number.isFinite(totalUserCost);
+  const accountNote = metric?.accountCount > 1 ? `，合计 ${metric.accountCount} 条同邮箱账号` : "";
+  return (
+    <td
+      className={`consumption-cell ${available ? "" : "consumption-cell-empty"}`}
+      title={available
+        ? `该账号在 Sub2API 中产生的累计用户实际扣费${accountNote}`
+        : metric?.error || (metric?.matched ? "Sub2API 暂无用户消费统计" : "Sub2API 中未找到该账号")}
+    >
+      {available ? formatUsd(totalUserCost) : "—"}
+    </td>
+  );
+}
+
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, sub2apiMetric }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1825,6 +1904,8 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           </div>
         )}
       </td>
+      <QuotaUsageCell metric={sub2apiMetric} />
+      <UserConsumptionCell metric={sub2apiMetric} />
       <td className="time-cell"><time dateTime={job.createdAt}>{formatDateTime(job.createdAt)}</time></td>
       <td className="operation-time-cell">
         <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
@@ -2093,6 +2174,36 @@ function formatDateTime(value) {
     second: "2-digit",
     hour12: false,
   }).format(date);
+}
+
+function formatQuotaReset(resetsAt, remainingSeconds) {
+  const resetTime = new Date(resetsAt || "").getTime();
+  const seconds = Number.isFinite(resetTime)
+    ? Math.max(0, Math.floor((resetTime - Date.now()) / 1_000))
+    : Math.max(0, Number(remainingSeconds) || 0);
+  const days = Math.floor(seconds / 86_400);
+  const hours = Math.floor((seconds % 86_400) / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const countdown = seconds <= 0
+    ? "即将重置"
+    : [days ? `${days}天` : "", hours ? `${hours}时` : "", `${minutes}分`].filter(Boolean).join("");
+  if (!Number.isFinite(resetTime)) return countdown;
+  const resetDate = new Date(resetTime);
+  const timestamp = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(resetDate);
+  return `${countdown} (${timestamp})`;
+}
+
+function formatUsd(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "—";
+  const digits = Math.abs(amount) < 1 && amount !== 0 ? 4 : 2;
+  return `$${amount.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
 function operationLabel(type) {

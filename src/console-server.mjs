@@ -36,6 +36,9 @@ const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
 const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
 const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
+const SUB2API_ACCOUNT_CACHE_MS = readDurationEnv("SUB2API_ACCOUNT_CACHE_MS", 60_000, 1_000);
+const SUB2API_METRICS_CACHE_MS = readDurationEnv("SUB2API_METRICS_CACHE_MS", 60_000, 1_000);
+const SUB2API_COST_CACHE_MS = readDurationEnv("SUB2API_COST_CACHE_MS", 5 * 60_000, 1_000);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
@@ -76,6 +79,9 @@ let shutdownPromise = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
+let sub2ApiAccountCache = { key: "", expiresAt: 0, accounts: null, promise: null };
+const sub2ApiUsageCache = new Map();
+const sub2ApiCostCache = new Map();
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
@@ -214,6 +220,7 @@ async function handleApi(req, res, requestUrl) {
         cancelAll: true,
         sub2apiUpload: true,
         sub2apiMonitor: true,
+        sub2apiMetrics: true,
         tlsFingerprint: true,
         totpSetup: true,
         passwordAdd: true,
@@ -478,6 +485,7 @@ async function handleApi(req, res, requestUrl) {
       enabled: body.enabled === true,
       autoUploadEnabled: body.autoUploadEnabled === true,
     };
+    clearSub2ApiMetricsCache();
     sub2ApiMonitorState.lastError = null;
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
@@ -489,6 +497,18 @@ async function handleApi(req, res, requestUrl) {
     if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "请先启用 Sub2API 号池监控");
     const result = await runSub2ApiMonitor("manual");
     sendJson(res, 200, { ...publicSub2ApiMonitorState(), result });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/account-metrics") {
+    const body = await readJson(req);
+    const emails = normalizeSub2ApiMetricEmails(body.emails);
+    if (!sub2ApiMonitorConfig?.baseUrl || !sub2ApiMonitorConfig?.adminApiKey) {
+      sendJson(res, 200, { configured: false, metrics: {} });
+      return;
+    }
+    const metrics = await getSub2ApiAccountMetrics(sub2ApiMonitorConfig, emails);
+    sendJson(res, 200, { configured: true, metrics, refreshedAt: new Date().toISOString() });
     return;
   }
 
@@ -2790,6 +2810,198 @@ async function getSub2ApiAccount(config, accountId) {
   }
 }
 
+function clearSub2ApiMetricsCache() {
+  sub2ApiAccountCache = { key: "", expiresAt: 0, accounts: null, promise: null };
+  sub2ApiUsageCache.clear();
+  sub2ApiCostCache.clear();
+}
+
+function normalizeSub2ApiMetricEmails(value) {
+  if (!Array.isArray(value)) throw httpError(400, "emails 必须是邮箱数组");
+  if (value.length > 100) throw httpError(400, "一次最多查询 100 个账号的统计数据");
+  const emails = new Set();
+  value.forEach((item) => {
+    const email = String(item || "").trim().toLowerCase();
+    if (!isEmail(email)) throw httpError(400, `邮箱格式错误：${email || "空值"}`);
+    emails.add(email);
+  });
+  return [...emails];
+}
+
+async function getSub2ApiAccountMetrics(config, emails) {
+  if (!emails.length) return {};
+  const requestedEmails = new Set(emails);
+  const accounts = (await listSub2ApiAccountsForMetrics(config)).filter((account) => {
+    const email = sub2ApiAccountEmail(account);
+    return email && requestedEmails.has(email) && isSub2ApiAccountInMonitoredGroups(account, config.groupIds);
+  });
+  const accountIds = [...new Set(accounts.map((account) => Number(account.id)).filter((id) => Number.isSafeInteger(id) && id > 0))];
+  const [usageByAccount, costByAccount] = await Promise.all([
+    getSub2ApiUsageMetrics(config, accountIds),
+    getSub2ApiCostMetrics(config, accounts),
+  ]);
+  const metrics = Object.fromEntries(emails.map((email) => [email, {
+    matched: false,
+    accountCount: 0,
+    fiveHour: null,
+    totalUserCost: null,
+    error: null,
+  }]));
+
+  for (const email of emails) {
+    const matches = accounts.filter((account) => sub2ApiAccountEmail(account) === email);
+    if (!matches.length) continue;
+    const usageResults = matches
+      .map((account) => usageByAccount.get(Number(account.id)))
+      .filter(Boolean);
+    const fiveHourCandidates = usageResults
+      .map((result) => ({ usage: result.usage, window: result.usage?.five_hour || null }))
+      .filter((result) => result.window && Number.isFinite(Number(result.window.utilization)))
+      .sort((left, right) => new Date(right.usage?.updated_at || 0).getTime() - new Date(left.usage?.updated_at || 0).getTime());
+    const costs = matches.map((account) => costByAccount.get(Number(account.id))).filter(Boolean);
+    const availableCosts = costs.filter((result) => Number.isFinite(result.totalUserCost));
+    metrics[email] = {
+      matched: true,
+      accountCount: matches.length,
+      fiveHour: fiveHourCandidates[0] ? {
+        utilization: Number(fiveHourCandidates[0].window.utilization),
+        resetsAt: fiveHourCandidates[0].window.resets_at || null,
+        remainingSeconds: Number(fiveHourCandidates[0].window.remaining_seconds || 0),
+        updatedAt: fiveHourCandidates[0].usage?.updated_at || null,
+      } : null,
+      totalUserCost: availableCosts.length
+        ? availableCosts.reduce((total, result) => total + result.totalUserCost, 0)
+        : null,
+      error: [...usageResults, ...costs].map((result) => result.error).find(Boolean) || null,
+    };
+  }
+  return metrics;
+}
+
+async function listSub2ApiAccountsForMetrics(config) {
+  const key = sub2ApiMetricsCacheKey(config);
+  if (sub2ApiAccountCache.key === key && sub2ApiAccountCache.accounts && sub2ApiAccountCache.expiresAt > Date.now()) {
+    return sub2ApiAccountCache.accounts;
+  }
+  if (sub2ApiAccountCache.key === key && sub2ApiAccountCache.promise) return sub2ApiAccountCache.promise;
+  const promise = (async () => {
+    const accounts = [];
+    for (let page = 1; page <= 1_000; page += 1) {
+      const query = new URLSearchParams({ page: String(page), page_size: "100", platform: "openai" });
+      const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+      const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+      if (!Array.isArray(data?.items)) throw new Error("Sub2API 账号列表格式不正确");
+      accounts.push(...data.items);
+      const reportedPages = Number(data.pages);
+      const pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
+        ? reportedPages
+        : Math.max(1, Math.ceil(Number(data.total || 0) / 100));
+      if (page >= pages || data.items.length === 0) return accounts;
+    }
+    throw new Error("Sub2API 账号列表超过分页上限，已停止统计查询");
+  })();
+  sub2ApiAccountCache = { key, expiresAt: 0, accounts: null, promise };
+  try {
+    const accounts = await promise;
+    if (sub2ApiAccountCache.promise === promise) {
+      sub2ApiAccountCache = { key, expiresAt: Date.now() + SUB2API_ACCOUNT_CACHE_MS, accounts, promise: null };
+    }
+    return accounts;
+  } catch (error) {
+    if (sub2ApiAccountCache.promise === promise) clearSub2ApiMetricsCache();
+    throw error;
+  }
+}
+
+async function getSub2ApiUsageMetrics(config, accountIds) {
+  const keyPrefix = sub2ApiMetricsCacheKey(config);
+  const results = new Map();
+  const missingIds = [];
+  for (const accountId of accountIds) {
+    const cacheKey = `${keyPrefix}:${accountId}`;
+    const cached = sub2ApiUsageCache.get(cacheKey);
+    if (cached?.expiresAt > Date.now()) results.set(accountId, cached.value);
+    else missingIds.push(accountId);
+  }
+  if (missingIds.length) {
+    const payload = await requestSub2Api(config, "/api/v1/admin/accounts/usage/batch", {
+      method: "POST",
+      body: JSON.stringify({ account_ids: missingIds, force: false }),
+    });
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    for (const accountId of missingIds) {
+      const value = {
+        usage: data?.usage?.[String(accountId)] || null,
+        error: typeof data?.errors?.[String(accountId)] === "string" ? data.errors[String(accountId)] : null,
+      };
+      sub2ApiUsageCache.set(`${keyPrefix}:${accountId}`, { value, expiresAt: Date.now() + SUB2API_METRICS_CACHE_MS });
+      results.set(accountId, value);
+    }
+  }
+  return results;
+}
+
+async function getSub2ApiCostMetrics(config, accounts) {
+  const results = new Map();
+  const uniqueAccounts = [...new Map(accounts.map((account) => [Number(account.id), account])).values()];
+  await mapWithConcurrency(uniqueAccounts, 5, async (account) => {
+    const accountId = Number(account.id);
+    const cacheKey = `${sub2ApiMetricsCacheKey(config)}:${accountId}`;
+    const cached = sub2ApiCostCache.get(cacheKey);
+    if (cached?.expiresAt > Date.now()) {
+      results.set(accountId, cached.value);
+      return;
+    }
+    let value;
+    try {
+      const startDate = sub2ApiAccountStartDate(account.created_at);
+      const endDate = new Date().toISOString().slice(0, 10);
+      const query = new URLSearchParams({
+        account_id: String(accountId),
+        start_date: startDate,
+        end_date: endDate,
+        timezone: "UTC",
+      });
+      const payload = await requestSub2Api(config, `/api/v1/admin/usage/stats?${query}`);
+      const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+      const totalUserCost = Number(data?.total_actual_cost);
+      value = {
+        totalUserCost: Number.isFinite(totalUserCost) ? totalUserCost : null,
+        error: Number.isFinite(totalUserCost) ? null : "Sub2API 未返回用户消费统计",
+      };
+    } catch (error) {
+      value = { totalUserCost: null, error: String(error?.message || error).slice(0, 300) };
+    }
+    sub2ApiCostCache.set(cacheKey, {
+      value,
+      expiresAt: Date.now() + (value.error ? SUB2API_METRICS_CACHE_MS : SUB2API_COST_CACHE_MS),
+    });
+    results.set(accountId, value);
+  });
+  return results;
+}
+
+function sub2ApiMetricsCacheKey(config) {
+  return crypto.createHash("sha256").update(`${config.baseUrl}:${config.adminApiKey}`).digest("hex").slice(0, 24);
+}
+
+function sub2ApiAccountStartDate(value) {
+  const date = new Date(value || "2020-01-01T00:00:00Z");
+  return Number.isNaN(date.getTime()) ? "2020-01-01" : date.toISOString().slice(0, 10);
+}
+
+async function mapWithConcurrency(items, concurrency, callback) {
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const currentIndex = index;
+      index += 1;
+      await callback(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+}
+
 async function listSub2ApiErrorAccounts(config) {
   const accounts = [];
   let page = 1;
@@ -2897,6 +3109,7 @@ function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
   const accountGroupIds = [
     ...(Array.isArray(account?.group_ids) ? account.group_ids : []),
     ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id) : []),
+    ...(Array.isArray(account?.groups) ? account.groups.map((item) => item?.id) : []),
   ].map(Number).filter(Number.isSafeInteger);
   return groupIds.some((id) => accountGroupIds.includes(Number(id)));
 }
